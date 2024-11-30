@@ -1,0 +1,222 @@
+version: '3.5'
+
+x-ulimits: &ulimit
+  ulimits:
+    nproc: 65535
+    nofile:
+      soft: 65535
+      hard: 65535
+
+services:
+  app:
+    container_name: ${PROJECT_NAME}_app
+    env_file:
+      - ../.env
+    build:
+      context: ../
+      dockerfile: ./deployments/dockerfiles/app/Dockerfile
+    ports:
+      - "${NET_IP}.1:80:80"
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.101
+
+  zookeeper:
+    container_name: ${PROJECT_NAME}_zookeeper
+    image: bitnami/zookeeper:3.8
+    <<: *ulimit
+    volumes:
+      - "zookeeper_data:/bitnami"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOO_ENABLE_AUTH: "yes"
+      ZOO_SERVER_USERS: k4fk4
+      ZOO_SERVER_PASSWORDS: k4fk4_p4ssw0rd
+      KAFKA_OPTS: -Djute.maxbuffer=500000000
+    healthcheck:
+      test: nc -z zookeeper 2181 || exit 1
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.102
+
+  kafka:
+    container_name: ${PROJECT_NAME}_kafka
+    hostname: "${PROJECT_NAME}-kafka.local"
+    image: bitnami/kafka:3.3.2
+    <<: *ulimit
+    volumes:
+      - "kafka_data:/bitnami"
+    ports:
+      - "${NET_IP}.1:9092:9092"
+    user: $GID:$UID
+    environment:
+      BITNAMI_DEBUG: "true"
+      ALLOW_PLAINTEXT_LISTENER: "true"
+      TZ: "Europe/Moscow"
+      KAFKA_ZOOKEEPER_PROTOCOL: SASL
+      KAFKA_ZOOKEEPER_USER: k4fk4
+      KAFKA_ZOOKEEPER_PASSWORD: k4fk4_p4ssw0rd
+      KAFKA_ENABLE_KRAFT: "no"
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CLIENT:SASL_PLAINTEXT
+      KAFKA_CFG_LISTENERS: INTERNAL://:9091,CLIENT://:9092
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://${PROJECT_NAME}-kafka.local:9091,CLIENT://${PROJECT_NAME}-kafka.local:9092
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_CFG_SASL_ENABLED_MECHANISMS: PLAIN
+      KAFKA_CLIENT_USERS: user
+      KAFKA_CLIENT_PASSWORDS: 123
+      KAFKA_HEAP_OPTS: '-Xmx2g -Xms2g'
+    healthcheck:
+      test: curl -s ${PROJECT_NAME}-kafka.local:9091 || result=$$?; test $$result = 52 || exit 1
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.103
+
+  kafka-ui:
+    container_name: ${PROJECT_NAME}_kafka-ui
+    image: provectuslabs/kafka-ui
+    ports:
+      - "${NET_IP}.1:8090:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=local
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=kafka:9091
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.104
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.3.0
+    hostname: kafka-registry
+    container_name: schema-registry
+    ports:
+      - "${NET_IP}.1:8091:80"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'kafka:9091'
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:80
+      SCHEMA_REGISTRY_ACCESS_CONTROL_ALLOW_METHODS: "*"
+      SCHEMA_REGISTRY_ACCESS_CONTROL_ALLOW_ORIGIN: "GET,POST,PUT,OPTIONS"
+    depends_on: [ kafka ]
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.105
+
+  rest-proxy:
+    image: confluentinc/cp-kafka-rest:7.3.0
+    hostname: kafka-proxy
+    container_name: rest-proxy
+    ports:
+      - "${NET_IP}.1:8092:80"
+    environment:
+      KAFKA_REST_HOST_NAME: kafka-proxy
+      KAFKA_REST_BOOTSTRAP_SERVERS: 'kafka:9091'
+      KAFKA_REST_LISTENERS: http://0.0.0.0:80
+      KAFKA_REST_SCHEMA_REGISTRY_URL: http://schema-registry:8090
+      KAFKA_REST_ACCESS_CONTROL_ALLOW_ORIGIN: "*"
+      KAFKA_REST_ACCESS_CONTROL_ALLOW_METHODS: "GET,POST,PUT,OPTIONS"
+      KAFKA_REST_ACCESS_CONTROL_ALLOW_HEADERS: "origin,content-type,accept,authorization"
+    depends_on: [ schema-registry ]
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.106
+
+  elasticsearch:
+    container_name: ${PROJECT_NAME}_elastic
+    image: elasticsearch:8.6.2
+    environment:
+      discovery.type: single-node
+      bootstrap.memory_lock: 'true'
+      ES_JAVA_OPTS: '-Xms2g -Xmx2g'
+      xpack.security.enabled: 'false'
+    volumes:
+      - '../_db/elasticsearch:/usr/share/elasticsearch/data:rw,z'
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.107
+
+  kibana:
+    container_name: ${PROJECT_NAME}_kibana
+    image: kibana:8.6.2
+    ports:
+      - "${NET_IP}.1:8093:5601"
+    restart: always
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+    depends_on:
+      - elasticsearch
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.108
+
+  product-consumer:
+    container_name: ${PROJECT_NAME}_product-consumer
+    env_file:
+      - ../.env
+    build:
+      context: ../
+      dockerfile: ./deployments/dockerfiles/consumers/product/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.109
+
+  category-consumer:
+    container_name: ${PROJECT_NAME}_category-consumer
+    env_file:
+      - ../.env
+    build:
+      context: ../
+      dockerfile: ./deployments/dockerfiles/consumers/category/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.110
+
+  property-consumer:
+    container_name: ${PROJECT_NAME}_property-consumer
+    env_file:
+      - ../.env
+    build:
+      context: ../
+      dockerfile: ./deployments/dockerfiles/consumers/property/Dockerfile
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      develop_net:
+        ipv4_address: ${NET_IP}.111
+
+networks:
+  develop_net:
+    name: ${PROJECT_NAME}
+    ipam:
+      driver: default
+      config:
+        -   subnet: ${NET_IP}.0/24
+volumes:
+  zookeeper_data:
+    driver: local
+  kafka_data:
+    driver: local
+  psql_volume_bp:
+    driver: local
